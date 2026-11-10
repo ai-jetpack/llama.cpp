@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-profiler.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -2086,6 +2087,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+    int prof_level = 0, prof_n = 0;
+    ggml_prof_slot * prof = ggml_prof_slots(&prof_level, &prof_n);
+    const uint64_t pt0 = prof ? ggml_prof_tick() : 0;
+    uint64_t pt1 = pt0;
+    auto prof_copy = [&](int path) {
+        if (prof) {
+            uint32_t prefix;
+            const uint32_t name = ggml_prof_hash(input->name, &prefix);
+            ggml_prof_name_bytes(name, input->name, ggml_nbytes(input));
+            const int split_id = (int) (split - sched->splits);
+            ggml_prof_push(&prof[0], pt0, pt1, ggml_prof_tick(), name, path, GGML_PROF_COPY, split_id);
+        }
+    };
+
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2093,7 +2108,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        pt1 = prof ? ggml_prof_tick() : 0;
         ggml_backend_tensor_copy(input, input_cpy);
+        prof_copy(GGML_PROF_COPY_USER);
         return;
     }
 
@@ -2106,6 +2123,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        prof_copy(GGML_PROF_COPY_CALLBACK);
         return;
     }
 
@@ -2118,13 +2136,33 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        pt1 = prof ? ggml_prof_tick() : 0;
         ggml_backend_tensor_copy(input, input_cpy);
+        prof_copy(GGML_PROF_COPY_SYNC);
+    } else {
+        pt1 = prof ? ggml_prof_tick() : 0;
+        prof_copy(GGML_PROF_COPY_ASYNC);
     }
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    int prof_level = 0, prof_n = 0;
+    ggml_prof_slot * prof = ggml_prof_slots(&prof_level, &prof_n);
+    uint64_t pt0 = 0;
+    if (prof) {
+        int64_t n_tokens = 0;
+        for (int i = 0; i < sched->graph.n_leafs; i++) {
+            if (strcmp(sched->graph.leafs[i]->name, "inp_tokens") == 0) {
+                n_tokens = sched->graph.leafs[i]->ne[0];
+                break;
+            }
+        }
+        const uint64_t t = ggml_prof_tick();
+        ggml_prof_push(&prof[0], t, t, (uint64_t) n_tokens, GGML_PROF_EV_GRAPH, 0, GGML_PROF_SCHED, 0);
+    }
 
     int prev_backend_id = -1;
 
@@ -2136,15 +2174,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            pt0 = prof ? ggml_prof_tick() : 0;
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            if (prof) {
+                ggml_prof_push(&prof[0], pt0, ggml_prof_tick(), prev_backend_id, GGML_PROF_EV_SYNC, 0, GGML_PROF_SCHED, split_id);
+            }
         }
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        pt0 = prof ? ggml_prof_tick() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
@@ -2155,9 +2198,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        if (prof && split->n_inputs > 0) {
+            ggml_prof_push(&prof[0], pt0, ggml_prof_tick(), split_backend_id, GGML_PROF_EV_COPY_IN, 0, GGML_PROF_SCHED, split_id);
+        }
 
         if (!sched->callback_eval) {
+            pt0 = prof ? ggml_prof_tick() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (prof) {
+                ggml_prof_push(&prof[0], pt0, ggml_prof_tick(), split_backend_id, GGML_PROF_EV_SUBMIT, 0, GGML_PROF_SCHED, split_id);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

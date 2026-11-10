@@ -1464,6 +1464,8 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    void * prof = nullptr; // ggml profiler state (GGML_PROFILE)
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

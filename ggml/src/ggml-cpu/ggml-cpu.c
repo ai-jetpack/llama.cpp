@@ -6,6 +6,7 @@
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "ggml-profiler.h"
 #include "quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
@@ -3145,6 +3146,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    int prof_level = 0, prof_n = 0;
+    ggml_prof_slot * prof = ggml_prof_slots(&prof_level, &prof_n);
+    ggml_prof_slot * ps = prof && state->ith < prof_n ? &prof[state->ith] : NULL;
+    uint64_t blk_t0 = 0, blk_compute = 0, blk_wait = 0;
+    uint32_t blk_name = 0;
+    int blk_n = 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3156,6 +3164,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const uint64_t t0 = ps ? ggml_prof_tick() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3172,9 +3182,43 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        const uint64_t t1 = ps ? ggml_prof_tick() : 0;
+
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (ps) {
+            const uint64_t t2 = ggml_prof_tick();
+            uint32_t prefix;
+            const uint32_t name = ggml_prof_hash(node->name, &prefix);
+            if (state->ith == 0) {
+                ggml_prof_name(name, node->name);
+                if (ggml_prof_is_topk(prefix)) {
+                    ggml_prof_count_experts(node);
+                }
+            }
+            if (prof_level == 2) {
+                ggml_prof_push(ps, t0, t1, t2, name, state->ith, GGML_PROF_OP, 1);
+            } else {
+                if (blk_n == 0) {
+                    blk_t0 = t0;
+                }
+                blk_compute += t1 - t0;
+                blk_wait    += t2 - t1;
+                blk_name     = name;
+                blk_n++;
+                if (ggml_prof_is_block_end(prefix)) {
+                    ggml_prof_push(ps, blk_t0, blk_compute, blk_wait, name, state->ith, GGML_PROF_BLOCK, blk_n);
+                    blk_compute = blk_wait = 0;
+                    blk_n = 0;
+                }
+            }
+        }
+    }
+
+    if (ps && blk_n > 0) {
+        ggml_prof_push(ps, blk_t0, blk_compute, blk_wait, blk_name, state->ith, GGML_PROF_BLOCK, blk_n);
     }
 
 #ifdef GGML_USE_OPENMP

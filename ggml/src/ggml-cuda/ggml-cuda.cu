@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/profiler.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -2887,6 +2888,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_prof_flush(*cuda_ctx);
     delete cuda_ctx;
     delete backend;
 }
@@ -4986,6 +4988,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            ggml_cuda_prof_begin(*cuda_ctx);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -5046,6 +5050,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (!is_concurrent_event_active) {
+                        for (int k = i; k <= i + nodes_to_skip; k++) {
+                            ggml_cuda_prof_node(*cuda_ctx, cgraph->nodes[k]);
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -5073,6 +5082,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_ASSERT(ok);
 
                 if (!is_concurrent_event_active) {
+                    ggml_cuda_prof_node(*cuda_ctx, node);
                     try_launch_concurrent_event(node);
                }
             }
@@ -5131,6 +5141,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_prof_prepare(*cuda_ctx);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
